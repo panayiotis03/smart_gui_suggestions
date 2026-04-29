@@ -1,0 +1,1384 @@
+import subprocess
+import sys
+
+def _ensure_packages():
+    required = {'reportlab': 'reportlab', 'matplotlib': 'matplotlib', 'numpy': 'numpy'}
+    for mod, pkg in required.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+_ensure_packages()
+
+import pandas as pd
+import glob
+import os
+import tkinter as tk
+from tkinter import filedialog, scrolledtext, messagebox, ttk
+from tkcalendar import DateEntry
+from datetime import date
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import tempfile
+import numpy as np
+
+# --- CONFIGURATION ---
+ROOM_STRUCTURE = {
+    "TOFIS":  ["standard"],
+    "DRAKOS": ["Front", "Back"],
+    "TASOS":  ["Front_Left", "Front_Right", "Back_Left", "Back_Right"]
+}
+
+# Αντιστοίχιση TASOS zone → sensor folder (Front_Right και Back_Left μοιράζονται sensor)
+TASOS_SENSOR_FOLDER = {
+    "Front_Left":  "TASOS_front_left",
+    "Front_Right": "TASOS_front_left",   # ίδιος αισθητήρας με Front_Left
+    "Back_Left":   "TASOS_back_right",   # ίδιος αισθητήρας με Back_Right
+    "Back_Right":  "TASOS_back_right",
+}
+
+# Όλα τα πιθανά ονόματα αρχείων (case-insensitive match)
+MONTH_FILE_ALIASES = {
+    '09': ['sep', 'sept', 'september'],
+    '10': ['oct', 'october'],
+    '11': ['nov', 'november'],
+    '12': ['dec', 'december'],
+    '01': ['jan', 'january', 'junu', 'june', 'juan'],  # JUan = drakos back Jan
+}
+
+MONTH_FEEDBACK_NAME = {
+    '09': 'Sep',
+    '10': 'Oct',
+    '11': 'Nov',
+    '12': 'Dec',
+    '01': 'Jan',
+}
+
+
+def get_seasonal_context(sel_date):
+    d = sel_date
+    if date(d.year, 9, 1) <= d <= date(d.year, 11, 20):
+        return "ΠΕΡΙΟΔΟΣ 1"
+    if d >= date(d.year, 11, 21) or d <= date(d.year, 1, 31):
+        return "ΠΕΡΙΟΔΟΣ 2"
+    return "ΕΚΤΟΣ ΠΕΡΙΟΔΟΥ"
+
+
+def update_parts(event=None):
+    selected_room = room_var.get()
+    parts = ROOM_STRUCTURE.get(selected_room, ["standard"])
+    part_cb['values'] = parts
+    part_var.set(parts[0])
+
+
+def find_sensor_csv(base_path, room, part, month_num):
+    aliases = MONTH_FILE_ALIASES.get(month_num, [])
+
+    if room == "TOFIS":
+        search_dirs = [
+            os.path.join(base_path, "Tofis"),
+            os.path.join(base_path, "tofis"),
+            base_path,
+        ]
+    elif room == "DRAKOS":
+        # Ο φάκελος είναι "drakos front" ή "drakos back" (lowercase)
+        part_lower = part.lower()   # "front" ή "back"
+        search_dirs = [
+            os.path.join(base_path, "drakos", f"drakos {part_lower}"),
+            os.path.join(base_path, "drakos"),
+            base_path,
+        ]
+    elif room == "TASOS":
+        # Front_Right/Back_Left μοιράζονται sensor με Front_Left/Back_Right
+        sensor_folder = TASOS_SENSOR_FOLDER.get(part, f"TASOS_{part.lower()}")
+        search_dirs = [
+            os.path.join(base_path, "tasos", sensor_folder),
+            os.path.join(base_path, "tasos"),
+            base_path,
+        ]
+    else:
+        search_dirs = [base_path]
+
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            name_no_ext = os.path.splitext(f)[0].lower()
+            if f.lower().endswith('.csv') and 'feedback' not in f.lower():
+                if name_no_ext in aliases:
+                    return os.path.join(d, f)
+    return None
+
+
+def find_feedback_csv(base_path, room, part, month_num):
+    fb_month = MONTH_FEEDBACK_NAME.get(month_num, '')
+
+    if room == "TOFIS":
+        candidates = [f"TOFIS_{fb_month}_feedbacks.csv"]
+        search_dirs = [
+            os.path.join(base_path, "Tofis"),
+            os.path.join(base_path, "tofis"),
+            base_path,
+        ]
+    elif room == "DRAKOS":
+        candidates = [f"DRAKOS_{part}_{fb_month}_feedbacks.csv"]
+        search_dirs = [
+            os.path.join(base_path, "drakos"),
+            base_path,
+        ]
+    elif room == "TASOS":
+        candidates = [f"TASOS_{part}_{fb_month}_feedbacks.csv"]
+        search_dirs = [
+            os.path.join(base_path, "tasos"),
+            base_path,
+        ]
+    else:
+        candidates = []
+        search_dirs = [base_path]
+
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            for c in candidates:
+                if f.lower() == c.lower():
+                    return os.path.join(d, f)
+    return None
+
+
+# =============================================================================
+#  DECISION TREE  –  ΠΕΡΙΟΔΟΣ 1: Θερμή / Μεταβατική (Σεπ – 20 Νοε)
+# =============================================================================
+def decision_tree_p1(v, comfort_pct, total_f):
+    """
+    Περίοδος 1: Θερμή/Μεταβατική
+    Αερισμός: άνοιγμα παραθύρων επιτρεπτό
+    T: 23–27°C | H: 40–60% (αποδ. 30–65%) | CO2: <1000 ok, 1000–1500 μέτριο, >1500 κακό
+    VOC: <300 ok μg/m³, 300–500 αποδεκτό, 500–1000 μέτριο, >1000 κακό (WHO/IAQ)
+    """
+    results = []
+
+    # ── 1. TEMPERATURE ────────────────────────────────────────────────────────
+    T = v.get('T')
+    if T == "N/A" or T is None:
+        results.append(('info', "Θερμοκρασία: Δεν υπάρχουν δεδομένα."))
+    elif T < 23:
+        results.append(('warn',
+            f"Θερμοκρασία ({T} °C) → Μείωση κλιματισμού ή κλείσιμο παραθύρων."))
+    elif T <= 27:
+        results.append(('ok',
+            f"Θερμοκρασία ({T} °C) βέλτιστη για Περίοδο 1 (23–27°C, ASHRAE)."))
+    else:
+        results.append(('alert',
+            f"Θερμοκρασία ({T} °C) → Άνοιγμα παραθύρων ή ενεργοποίηση A/C."))
+
+    # ── 2. HUMIDITY ───────────────────────────────────────────────────────────
+    H = v.get('H')
+    if H == "N/A" or H is None:
+        results.append(('info', "Υγρασία: Δεν υπάρχουν δεδομένα."))
+    elif H < 30:
+        results.append(('alert',
+            f"Υγρασία ({H} %) → Χρήση υγραντήρα ή λειτουργία υγρασίας A/C."))
+    elif H < 40:
+        results.append(('warn',
+            f"Υγρασία ({H} %) → Ελαφρά χαμηλή, συνιστάται αύξηση υγρασίας."))
+    elif H <= 60:
+        results.append(('ok',
+            f"Υγρασία ({H} %) βέλτιστη για Περίοδο 1 (40–60%, ASHRAE)."))
+    elif H <= 65:
+        results.append(('warn',
+            f"Υγρασία ({H} %) → Ελαφρύ άνοιγμα παραθύρων ή χρήση αφυγραντήρα."))
+    else:
+        results.append(('alert',
+            f"Υγρασία ({H} %) → Άνοιγμα παραθύρων & χρήση αφυγραντήρα."))
+
+    # ── 3. CO2 ────────────────────────────────────────────────────────────────
+    C = v.get('C')
+    if C == "N/A" or C is None:
+        results.append(('info', "CO2: Δεν υπάρχουν δεδομένα."))
+    elif C < 600:
+        results.append(('ok',
+            f"CO2 ({C} ppm) → Εξαιρετική ποιότητα αέρα."))
+    elif C <= 1000:
+        results.append(('ok',
+            f"CO2 ({C} ppm) → Καλό επίπεδο για Περίοδο 1."))
+    elif C <= 1500:
+        results.append(('warn',
+            f"CO2 ({C} ppm) → Άνοιγμα παραθύρων για φυσικό αερισμό."))
+    else:
+        results.append(('alert',
+            f"CO2 ({C} ppm) → Άμεσος αερισμός – άνοιγμα παραθύρων & πόρτων."))
+
+    # ── 4. VOC ────────────────────────────────────────────────────────────────
+    VOC = v.get('VOC')
+    if VOC == "N/A" or VOC is None:
+        results.append(('info', "VOC: Δεν υπάρχουν δεδομένα."))
+    else:
+        voc_ugm3 = round(VOC * 3, 0)
+        if voc_ugm3 < 300:
+            results.append(('ok',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Αποδεκτή ποιότητα."))
+        elif voc_ugm3 <= 500:
+            results.append(('warn',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Αύξηση αερισμού μέσω ανοίγματος παραθύρων."))
+        elif voc_ugm3 <= 1000:
+            results.append(('warn',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Έντονος αερισμός – άνοιγμα παραθύρων & πόρτων."))
+        else:
+            results.append(('alert',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Άμεσος αερισμός & εντοπισμός χημικών πηγών."))
+
+    return results
+
+
+# =============================================================================
+#  DECISION TREE  –  ΠΕΡΙΟΔΟΣ 2: Ψυχρή (20 Νοε – Ιαν)
+# =============================================================================
+def decision_tree_p2(v, comfort_pct, total_f):
+    """
+    Περίοδος 2: Ψυχρή
+    Αερισμός: ΜΟΝΟ HVAC/A/C – ΟΧΙ άνοιγμα παραθύρων
+    T: 20–24°C | H: 30–50% (αποδ. 30–60%) | CO2: <1200 ok, 1200–1500 μέτριο, >1500 κακό
+    VOC: ίδια κατώφλια με Π1 (WHO/IAQ)
+    """
+    results = []
+
+    # ── 1. TEMPERATURE ────────────────────────────────────────────────────────
+    T = v.get('T')
+    if T == "N/A" or T is None:
+        results.append(('info', "Θερμοκρασία: Δεν υπάρχουν δεδομένα."))
+    elif T < 20:
+        results.append(('alert',
+            f"Θερμοκρασία ({T} °C) → Αύξηση θέρμανσης & κλείσιμο παραθύρων."))
+    elif T <= 24:
+        results.append(('ok',
+            f"Θερμοκρασία ({T} °C) βέλτιστη για Περίοδο 2 (20–24°C, ASHRAE)."))
+    else:
+        results.append(('warn',
+            f"Θερμοκρασία ({T} °C) → Μείωση θέρμανσης ή χρήση HVAC/A/C."))
+
+    # ── 2. HUMIDITY ───────────────────────────────────────────────────────────
+    H = v.get('H')
+    if H == "N/A" or H is None:
+        results.append(('info', "Υγρασία: Δεν υπάρχουν δεδομένα."))
+    elif H < 30:
+        results.append(('alert',
+            f"Υγρασία ({H} %) → Χρήση υγραντήρα (τάση μείωσης υγρασίας χειμερινής περιόδου)."))
+    elif H <= 50:
+        results.append(('ok',
+            f"Υγρασία ({H} %) βέλτιστη για Περίοδο 2 (30–50%, ASHRAE)."))
+    elif H <= 60:
+        results.append(('warn',
+            f"Υγρασία ({H} %) → Χρήση αφυγραντήρα ή HVAC/A/C."))
+    else:
+        results.append(('alert',
+            f"Υγρασία ({H} %) → Χρήση αφυγραντήρα ή HVAC/A/C."))
+
+    # ── 3. CO2 ────────────────────────────────────────────────────────────────
+    C = v.get('C')
+    if C == "N/A" or C is None:
+        results.append(('info', "CO2: Δεν υπάρχουν δεδομένα."))
+    elif C < 1000:
+        results.append(('ok',
+            f"CO2 ({C} ppm) → Καλό επίπεδο για Περίοδο 2."))
+    elif C <= 1200:
+        results.append(('ok',
+            f"CO2 ({C} ppm) → Αποδεκτό επίπεδο χειμερινών συνθηκών."))
+    elif C <= 1500:
+        results.append(('warn',
+            f"CO2 ({C} ppm) → Ενεργοποίηση μηχανικού εξαερισμού HVAC/A/C."))
+    else:
+        results.append(('alert',
+            f"CO2 ({C} ppm) → Άμεση ενεργοποίηση HVAC/A/C."))
+
+    # ── 4. VOC ────────────────────────────────────────────────────────────────
+    VOC = v.get('VOC')
+    if VOC == "N/A" or VOC is None:
+        results.append(('info', "VOC: Δεν υπάρχουν δεδομένα."))
+    else:
+        voc_ugm3 = round(VOC * 3, 0)
+        if voc_ugm3 < 300:
+            results.append(('ok',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Αποδεκτή ποιότητα."))
+        elif voc_ugm3 <= 500:
+            results.append(('warn',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Αύξηση αερισμού μέσω HVAC/A/C."))
+        elif voc_ugm3 <= 1000:
+            results.append(('warn',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Ενεργοποίηση HVAC/A/C & αποφυγή χημικών πηγών."))
+        else:
+            results.append(('alert',
+                f"VOC ({VOC} ppb ≈ {voc_ugm3:.0f} μg/m³) → Άμεση ενεργοποίηση HVAC/A/C & εντοπισμός χημικών πηγών."))
+
+    return results
+
+
+# =============================================================================
+#  ΚΟΙΝΕΣ ΠΑΡΑΜΕΤΡΟΙ  –  PM1, PM2.5, Θόρυβος, Πίεση (ίδιες και στις 2 περιόδους)
+# =============================================================================
+def decision_tree_common(v, comfort_pct, total_f, P1):
+    """PM1, PM2.5, Noise, Pressure – ίδια κατώφλια και στις 2 περιόδους."""
+    results = []
+
+    # ── PM1 ───────────────────────────────────────────────────────────────────
+    PM1 = v.get('PM1')
+    if PM1 == "N/A" or PM1 is None:
+        results.append(('info', "PM1: Δεν υπάρχουν δεδομένα."))
+    elif PM1 < 10:
+        results.append(('ok',
+            f"PM1 ({PM1} μg/m³) < 10 μg/m³ → Καθαρός αέρας."))
+    elif PM1 <= 20:
+        if P1:
+            results.append(('warn',
+                f"PM1 ({PM1} μg/m³) 10–20 μg/m³ → Αύξηση φιλτραρίσματος αέρα μέσω ανοίγματος παραθύρων."))
+        else:
+            results.append(('warn',
+                f"PM1 ({PM1} μg/m³) 10–20 μg/m³ → Χρήση φίλτρου αέρα / HVAC."))
+    else:
+        if P1:
+            results.append(('alert',
+                f"PM1 ({PM1} μg/m³) > 20 μg/m³ → Άμεσος αερισμός & χρήση καθαριστή αέρα."))
+        else:
+            results.append(('alert',
+                f"PM1 ({PM1} μg/m³) > 20 μg/m³ → Χρήση καθαριστή αέρα / HVAC – αποφύγετε άνοιγμα παραθύρων."))
+
+    # ── PM2.5 ─────────────────────────────────────────────────────────────────
+    PM25 = v.get('PM25')
+    if PM25 == "N/A" or PM25 is None:
+        results.append(('info', "PM2.5: Δεν υπάρχουν δεδομένα."))
+    elif PM25 < 12:
+        results.append(('ok',
+            f"PM2.5 ({PM25} μg/m³) < 12 μg/m³ → Καλή ποιότητα αέρα (WHO)."))
+    elif PM25 <= 25:
+        if P1:
+            results.append(('warn',
+                f"PM2.5 ({PM25} μg/m³) 12–25 μg/m³ → Αύξηση αερισμού μέσω ανοίγματος παραθύρων."))
+        else:
+            results.append(('warn',
+                f"PM2.5 ({PM25} μg/m³) 12–25 μg/m³ → Χρήση καθαριστή αέρα / HVAC."))
+    else:
+        if P1:
+            results.append(('alert',
+                f"PM2.5 ({PM25} μg/m³) > 25 μg/m³ → Άμεσος αερισμός & χρήση καθαριστή αέρα."))
+        else:
+            results.append(('alert',
+                f"PM2.5 ({PM25} μg/m³) > 25 μg/m³ → Άμεση χρήση καθαριστή αέρα / HVAC – αποφύγετε άνοιγμα παραθύρων."))
+
+    # ── NOISE ─────────────────────────────────────────────────────────────────
+    N = v.get('N')
+    if N == "N/A" or N is None:
+        results.append(('info', "Θόρυβος: Δεν υπάρχουν δεδομένα."))
+    elif N < 35:
+        results.append(('ok',
+            f"Θόρυβος ({N} dBA) < 35 dBA → Ήσυχο περιβάλλον."))
+    elif N <= 50:
+        results.append(('warn',
+            f"Θόρυβος ({N} dBA) 35–50 dBA → Κλείσιμο παραθύρων για μείωση εξωτερικού θορύβου."))
+    else:
+        results.append(('alert',
+            f"Θόρυβος ({N} dBA) > 50 dBA → Εντοπισμός & μείωση πηγών θορύβου, κλείσιμο παραθύρων."))
+
+    # ── PRESSURE ──────────────────────────────────────────────────────────────
+    P = v.get('P')
+    if P == "N/A" or P is None:
+        results.append(('info', "Πίεση: Δεν υπάρχουν δεδομένα."))
+    elif 980 <= P <= 1050:
+        results.append(('ok',
+            f"Πίεση ({P} hPa) 980–1050 hPa → Κανονική ατμοσφαιρική πίεση."))
+    else:
+        results.append(('alert',
+            f"Πίεση ({P} hPa) εκτός ορίων (980–1050 hPa) → Ανίχνευση ατμοσφαιρικής αλλαγής, παρακολούθηση."))
+
+    # ── STUDENT SATISFACTION ──────────────────────────────────────────────────
+    if total_f >= 3 and comfort_pct is not None:
+        if comfort_pct < 40:
+            results.append(('alert',
+                f"Ικανοποίηση φοιτητών ({comfort_pct:.1f}%) → Χαμηλή άνεση, απαιτείται παρέμβαση."))
+        elif comfort_pct < 65:
+            results.append(('warn',
+                f"Ικανοποίηση φοιτητών ({comfort_pct:.1f}%) → Μέτρια άνεση, παρακολούθηση συνιστάται."))
+        else:
+            results.append(('ok',
+                f"Ικανοποίηση φοιτητών ({comfort_pct:.1f}%) → Υψηλή θερμική άνεση."))
+
+    return results
+
+
+# =============================================================================
+#  ΚΥΡΙΑ ΣΥΝΑΡΤΗΣΗ ΑΝΑΛΥΣΗΣ
+# =============================================================================
+def run_analysis():
+    path = folder_path.get()
+    room, part = room_var.get(), part_var.get()
+
+    if not path:
+        messagebox.showwarning("Warning", "Please SELECT FOLDER first.")
+        return
+
+    sel_date  = cal.get_date()
+    h, m      = int(hour_box.get()), int(minute_box.get())
+    season_id = get_seasonal_context(sel_date)
+    month_num = sel_date.strftime('%m')
+
+    target_time = pd.Timestamp(
+        year=sel_date.year, month=sel_date.month, day=sel_date.day, hour=h, minute=m
+    )
+    s_start = target_time - pd.Timedelta(minutes=30)
+    s_end   = target_time + pd.Timedelta(minutes=30)
+    f_start = target_time - pd.Timedelta(minutes=90)
+    f_end   = target_time + pd.Timedelta(minutes=90)
+
+    txt_area.delete('1.0', tk.END)
+
+    s_path = find_sensor_csv(path, room, part, month_num)
+    f_path = find_feedback_csv(path, room, part, month_num)
+
+    txt_area.insert(tk.END,
+        f"  DOMOGNOSTICS ANALYSIS | {sel_date.strftime('%d/%m/%Y')} {target_time.strftime('%H:%M')}\n", 'header')
+    txt_area.insert(tk.END, f"  CLIMATE CONTEXT: {season_id}\n")
+    txt_area.insert(tk.END, "=" * 65 + "\n")
+    txt_area.insert(tk.END,
+        f"  Sensor CSV   : {os.path.basename(s_path) if s_path else '❌ ΔΕΝ ΒΡΕΘΗΚΕ'}\n")
+    # Αν TASOS zone μοιράζεται αισθητήρα, δείξε ποιος χρησιμοποιείται
+    if room == "TASOS" and s_path:
+        sensor_folder_used = TASOS_SENSOR_FOLDER.get(part, '')
+        if part.lower() not in sensor_folder_used.lower():
+            txt_area.insert(tk.END,
+                f"  ℹ️  Sensor zone  : {sensor_folder_used} (κοινός αισθητήρας για {part})\n", 'info')
+    txt_area.insert(tk.END,
+        f"  Feedback CSV : {os.path.basename(f_path) if f_path else '❌ ΔΕΝ ΒΡΕΘΗΚΕ'}\n")
+    txt_area.insert(tk.END, "=" * 65 + "\n")
+
+    if not s_path or not f_path:
+        txt_area.insert(tk.END, "  ⚠️  Λείπουν αρχεία. Ελέγξτε τον φάκελο.\n", 'alert')
+        return
+
+    try:
+        # ── Φόρτωση CSV ───────────────────────────────────────────────────────
+        df_s = None
+        for enc in ('utf-8', 'latin-1', 'cp1252'):
+            try:
+                df_s = pd.read_csv(s_path, sep=None, engine='python', encoding=enc)
+                break
+            except Exception:
+                continue
+
+        df_f = None
+        for enc in ('utf-8', 'latin-1', 'cp1252'):
+            try:
+                df_f = pd.read_csv(f_path, sep=None, engine='python', encoding=enc)
+                break
+            except Exception:
+                continue
+
+        if df_s is None or df_f is None:
+            txt_area.insert(tk.END, "  ❌  Αδυναμία ανάγνωσης CSV.\n", 'alert')
+            return
+
+        # ── Timestamps ────────────────────────────────────────────────────────
+        df_s['Timestamp'] = pd.to_datetime(
+            df_s['Time'], utc=True, errors='coerce'
+        ).dt.tz_localize(None)
+
+        df_f['Timestamp'] = pd.to_datetime(
+            df_f['Timestamp'], utc=False, errors='coerce'
+        )
+
+        snap     = df_s[(df_s['Timestamp'] >= s_start) & (df_s['Timestamp'] <= s_end)]
+        window_f = df_f[(df_f['Timestamp'] >= f_start) & (df_f['Timestamp'] <= f_end)].copy()
+
+        if snap.empty:
+            txt_area.insert(tk.END,
+                f"  ⚠️  Δεν βρέθηκαν sensor δεδομένα για "
+                f"{s_start.strftime('%H:%M')} – {s_end.strftime('%H:%M')}.\n", 'alert')
+            return
+
+        # ── Ανίχνευση στηλών ──────────────────────────────────────────────────
+        m_col = next(
+            (c for c in snap.columns if 'measurement' in c.lower() and 'type' in c.lower()),
+            next((c for c in snap.columns if 'meas' in c.lower()), None)
+        )
+        v_col = next(
+            (c for c in snap.columns if c.lower() == 'value'),
+            next((c for c in snap.columns if 'valu' in c.lower()), None)
+        )
+
+        if m_col is None or v_col is None:
+            txt_area.insert(tk.END,
+                f"  ⚠️  Δεν βρέθηκαν στήλες measurement/value.\n"
+                f"      Διαθέσιμες: {list(snap.columns)}\n", 'alert')
+            return
+
+        def get_val(exact_names):
+            mask = snap[m_col].astype(str).str.strip().str.lower().isin(
+                [n.lower() for n in exact_names]
+            )
+            vals = pd.to_numeric(snap.loc[mask, v_col], errors='coerce').dropna()
+            return round(vals.mean(), 1) if not vals.empty else "N/A"
+
+        v = {
+            'T':    get_val(['Temperature']),
+            'H':    get_val(['Humidity']),
+            'C':    get_val(['Carbon Dioxide', 'CO2']),
+            'VOC':  get_val(['VOC', 'Volatile Organic Compounds']),
+            'PM1':  get_val(['PM1', 'PM 1', 'PM1.0', 'pm1.0']),
+            'PM25': get_val(['PM2.5', 'PM 2.5', 'pm2.5']),
+            'N':    get_val(['Noise']),
+            'P':    get_val(['Pressure']),
+        }
+
+        # ── Student Satisfaction ──────────────────────────────────────────────
+        # Τύπος: (Count_Comfortable × 1.0 + Count_Neutral × 0.5) / Total × 100
+        # Θετικά: Comfortable, Pleasant = 1.0
+        # Ουδέτερα: Neutral, Noticeable = 0.5
+        # Αρνητικά: Too Hot, Too Cold, Too Dry, Too Humid, Irritating, Unpleasant = 0.0
+        FEEDBACK_WEIGHTS = {
+            'comfortable': 1.0,
+            'pleasant':    1.0,
+            'neutral':     0.5,
+            'noticeable':  0.5,
+            'irritating':  0.0,
+            'too hot':     0.0,
+            'too cold':    0.0,
+            'too dry':     0.0,
+            'too humid':   0.0,
+            'unpleasant':  0.0,
+        }
+
+        total_f         = len(window_f)
+        comfort_pct     = None
+        fb_col          = None
+        category_counts = {}
+
+        if total_f > 0:
+            fb_col = 'Temperature_Feedback' if 'Temperature_Feedback' in window_f.columns else None
+            if fb_col is None:
+                fb_col = next(
+                    (c for c in window_f.columns
+                     if any(k in c.lower() for k in ('temp', 'feed', 'comfort'))),
+                    None
+                )
+
+            if fb_col:
+                normalized      = window_f[fb_col].astype(str).str.strip()
+                category_counts = normalized.value_counts().to_dict()
+
+                # Σταθμισμένος δείκτης ικανοποίησης
+                weighted_sum = sum(
+                    FEEDBACK_WEIGHTS.get(lbl.lower(), 0.0) * cnt
+                    for lbl, cnt in category_counts.items()
+                )
+                comfort_pct = round((weighted_sum / total_f) * 100, 1)
+
+        # ── ΕΜΦΑΝΙΣΗ ΜΕΤΡΗΣΕΩΝ ────────────────────────────────────────────────
+        txt_area.insert(tk.END,
+            f"\n  1. SENSOR DATA  (±30 λεπτά | {s_start.strftime('%H:%M')} – {s_end.strftime('%H:%M')})\n",
+            'section')
+        txt_area.insert(tk.END, "-" * 65 + "\n")
+        txt_area.insert(tk.END, f"     Θερμοκρασία   : {v['T']} °C\n")
+        txt_area.insert(tk.END, f"     Υγρασία        : {v['H']} %\n")
+        txt_area.insert(tk.END, f"     CO2            : {v['C']} ppm\n")
+        txt_area.insert(tk.END, f"     VOC            : {v['VOC']} ppb\n")
+        txt_area.insert(tk.END, f"     PM1            : {v['PM1']} μg/m³\n")
+        txt_area.insert(tk.END, f"     PM2.5          : {v['PM25']} μg/m³\n")
+        txt_area.insert(tk.END, f"     Θόρυβος        : {v['N']} dBA\n")
+        txt_area.insert(tk.END, f"     Πίεση          : {v['P']} hPa\n\n")
+
+        # ── STUDENT SATISFACTION ──────────────────────────────────────────────
+        txt_area.insert(tk.END,
+            f"  2. STUDENT SATISFACTION  (±90 λεπτά | {f_start.strftime('%H:%M')} – {f_end.strftime('%H:%M')})\n",
+            'section')
+        txt_area.insert(tk.END, "-" * 65 + "\n")
+        if total_f == 0:
+            txt_area.insert(tk.END, "     Feedbacks    : 0  →  Δεν υπάρχουν δεδομένα satisfaction.\n")
+        elif not fb_col:
+            txt_area.insert(tk.END, f"     Feedbacks    : {total_f}  →  Δεν βρέθηκε στήλη feedback.\n")
+        else:
+            txt_area.insert(tk.END, f"     Feedbacks    : {total_f}\n")
+            txt_area.insert(tk.END, f"     Satisfaction : {comfort_pct:.1f}%\n")
+            # Ανάλυση ανά κατηγορία απάντησης
+            txt_area.insert(tk.END, "     " + "·" * 40 + "\n")
+            for label, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+                pct = (count / total_f) * 100
+                txt_area.insert(tk.END, f"     {label:<22}: {count:>2}  ({pct:.1f}%)\n")
+
+        # ── DECISION TREE ΑΠΟΤΕΛΕΣΜΑΤΑ ────────────────────────────────────────
+        P1 = (season_id == "ΠΕΡΙΟΔΟΣ 1")
+        period_title = (
+            "ΠΕΡΙΟΔΟΣ 1 – Θερμή/Μεταβατική  [Σεπ – 20 Νοε]"
+            if P1 else
+            "ΠΕΡΙΟΔΟΣ 2 – Ψυχρή  [20 Νοε – Ιαν]"
+        )
+        txt_area.insert(tk.END,
+            f"\n  3. ΑΠΟΤΕΛΕΣΜΑΤΑ DECISION TREE  |  {period_title}\n", 'section')
+        txt_area.insert(tk.END, "=" * 65 + "\n")
+
+        # Κύριες παράμετροι περιόδου (T, H, CO2, VOC)
+        if P1:
+            decisions_main = decision_tree_p1(v, comfort_pct, total_f)
+        else:
+            decisions_main = decision_tree_p2(v, comfort_pct, total_f)
+
+        # Κοινές παράμετροι (PM1, PM2.5, Noise, Pressure, Satisfaction)
+        decisions_common = decision_tree_common(v, comfort_pct, total_f, P1)
+
+        decisions = decisions_main + decisions_common
+
+        has_alert = any(s == 'alert' for s, _ in decisions)
+        has_warn  = any(s == 'warn'  for s, _ in decisions)
+
+        # Εμφάνιση ΜΟΝΟ των παραμέτρων εκτός ορίων (warn / alert / info)
+        out_of_range = [(s, m) for s, m in decisions if s != 'ok']
+
+        if not out_of_range:
+            txt_area.insert(tk.END, "  ✅  Όλες οι παράμετροι εντός ορίων.\n", 'success')
+        else:
+            for status, msg in out_of_range:
+                suggestion = msg.split('→')[-1].strip() if '→' in msg else msg
+                param      = msg.split('→')[0].strip()
+                if status == 'warn':
+                    txt_area.insert(tk.END, f"  ⚠️   {param}\n        → {suggestion}\n", 'warning')
+                elif status == 'alert':
+                    txt_area.insert(tk.END, f"  🚨  {param}\n        → {suggestion}\n", 'alert')
+                else:
+                    txt_area.insert(tk.END, f"  ℹ️   {param}\n        → {suggestion}\n", 'info')
+
+        # ── ΣΥΓΚΡΙΣΗ ΑΝΤΙΚΕΙΜΕΝΙΚΩΝ & ΥΠΟΚΕΙΜΕΝΙΚΩΝ ΔΕΔΟΜΕΝΩΝ ────────────────
+        if total_f >= 1 and comfort_pct is not None and fb_col:
+            txt_area.insert(tk.END, "-" * 65 + "\n")
+            txt_area.insert(tk.END, "  4. ΣΥΣΧΕΤΙΣΗ ΜΕΤΡΗΣΕΩΝ – ΑΝΤΙΛΗΨΗΣ ΦΟΙΤΗΤΩΝ\n", 'section')
+            txt_area.insert(tk.END, "-" * 65 + "\n")
+
+            neg_labels = [l for l in category_counts
+                          if l.lower() not in ('comfortable', 'nan', 'none', '')]
+            neg_count  = sum(category_counts[l] for l in neg_labels)
+            sensor_ok  = not any(s in ('alert', 'warn') for s, _ in decisions_main)
+
+            if sensor_ok and neg_count > 0:
+                neg_pct = (neg_count / total_f) * 100
+                neg_str = ", ".join(f"{l} ({category_counts[l]})" for l in neg_labels)
+                txt_area.insert(tk.END,
+                    f"  ⚠️   ΑΣΥΜΦΩΝΙΑ: Αποδεκτές μετρήσεις αλλά {neg_count}/{total_f}"
+                    f" φοιτητές ({neg_pct:.0f}%) δηλώνουν: {neg_str}.\n"
+                    f"        → Πιθανή αιτία: τοπική ανομοιογένεια (θέση καθίσματος,\n"
+                    f"           ηλιακή ακτινοβολία, εγγύτητα σε A/C ή θερμαντικό σώμα).\n"
+                    f"        → Εισήγηση: Επανεξέταση διάταξης χώρου & θέσεων φοιτητών.\n",
+                    'warning')
+
+            elif not sensor_ok and comfort_pct == 100 and total_f >= 2:
+                txt_area.insert(tk.END,
+                    f"  ℹ️   ΠΑΡΑΤΗΡΗΣΗ: Παρά τις εκτός ορίων μετρήσεις, {total_f}"
+                    f" φοιτητές δηλώνουν 100% άνεση.\n"
+                    f"        → Πιθανή αιτία: προσαρμογή στις συνθήκες ή σύντομη διάρκεια έκθεσης.\n"
+                    f"        → Εισήγηση: Παρακολούθηση σε μεγαλύτερο χρονικό διάστημα.\n",
+                    'info')
+
+            elif not sensor_ok and neg_count > 0:
+                neg_pct = (neg_count / total_f) * 100
+                neg_str = ", ".join(f"{l} ({category_counts[l]})" for l in neg_labels)
+                txt_area.insert(tk.END,
+                    f"  🚨  ΣΥΜΦΩΝΙΑ ΠΡΟΒΛΗΜΑΤΟΣ: Εκτός ορίων μετρήσεις ΚΑΙ"
+                    f" {neg_count}/{total_f} φοιτητές ({neg_pct:.0f}%) δηλώνουν: {neg_str}.\n"
+                    f"        → Απαιτείται άμεση παρέμβαση για βελτίωση ποιότητας αέρα.\n",
+                    'alert')
+
+            else:
+                txt_area.insert(tk.END,
+                    f"  ✅  ΣΥΜΦΩΝΙΑ: Αποδεκτές μετρήσεις & {comfort_pct:.0f}%"
+                    f" ικανοποίηση φοιτητών.\n",
+                    'success')
+
+        txt_area.insert(tk.END, "=" * 65 + "\n")
+
+        if has_alert:
+            txt_area.insert(tk.END,
+                "  🚨  ΣΥΝΟΛΙΚΗ ΚΑΤΑΣΤΑΣΗ: ΑΠΑΙΤΟΥΝΤΑΙ ΑΜΕΣΕΣ ΕΝΕΡΓΕΙΕΣ\n", 'alert')
+        elif has_warn:
+            txt_area.insert(tk.END,
+                "  ⚠️   ΣΥΝΟΛΙΚΗ ΚΑΤΑΣΤΑΣΗ: ΧΡΕΙΑΖΕΤΑΙ ΠΑΡΑΚΟΛΟΥΘΗΣΗ\n", 'warning')
+        else:
+            txt_area.insert(tk.END,
+                "  ✅  ΣΥΝΟΛΙΚΗ ΚΑΤΑΣΤΑΣΗ: ΒΕΛΤΙΣΤΕΣ ΣΥΝΘΗΚΕΣ\n", 'success')
+
+        # Αποθήκευση δεδομένων για PDF export
+        save_as_pdf._analysis_data = {
+            'v':              v,
+            'comfort_pct':    comfort_pct,
+            'category_counts':category_counts,
+            'total_f':        total_f,
+            'target_time':    target_time,
+            'season_id':      season_id,
+        }
+
+    except Exception as e:
+        import traceback
+        txt_area.insert(tk.END, f"  ❌  Error: {e}\n", 'alert')
+        txt_area.insert(tk.END, traceback.format_exc(), 'alert')
+
+
+def generate_dual_axis_chart(v, comfort_pct, category_counts, target_time, season_id):
+    """Dual-Axis Chart: sensor bars + satisfaction line."""
+    import matplotlib
+    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+
+    labels = ['Θερμ.(°C)', 'Υγρασία(%)', 'CO2(ppm/10)', 'PM2.5\n(μg/m³)', 'Θόρυβος\n(dBA)']
+    raw    = [
+        v.get('T'),
+        v.get('H'),
+        v.get('C'),
+        v.get('PM25'),
+        v.get('N'),
+    ]
+    values = [(x / 10 if i == 2 else x) if (x != 'N/A' and x is not None) else 0
+              for i, x in enumerate(raw)]
+    colors = ['#E74C3C', '#3498DB', '#27AE60', '#9B59B6', '#F39C12']
+
+    fig, ax1 = plt.subplots(figsize=(9, 4))
+    fig.patch.set_facecolor('#F8F9FA')
+    ax1.set_facecolor('#FFFFFF')
+
+    bars = ax1.bar(labels, values, color=colors, alpha=0.82, width=0.5,
+                   edgecolor='white', linewidth=0.8)
+    for bar, val in zip(bars, raw):
+        if val != 'N/A' and val is not None:
+            display = f'{val:.1f}' if isinstance(val, float) else str(val)
+            ax1.text(bar.get_x() + bar.get_width()/2,
+                     bar.get_height() + 0.5, display,
+                     ha='center', va='bottom', fontsize=7.5, color='#2C3E50')
+
+    ax1.set_ylabel('Τιμή αισθητήρα', fontsize=9, color='#2C3E50')
+    ax1.set_ylim(0, max((v for v in values if v), default=10) * 1.45)
+    ax1.tick_params(axis='both', labelsize=8)
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+
+    ax2 = ax1.twinx()
+    sat = comfort_pct if comfort_pct is not None else 0
+    color_sat = '#27AE60' if sat >= 65 else ('#F39C12' if sat >= 40 else '#E74C3C')
+    ax2.axhline(y=sat, color=color_sat, linestyle='--', linewidth=2.2,
+                label=f'Satisfaction Index: {sat:.1f}%')
+    ax2.fill_between(range(len(labels)), sat, alpha=0.08, color=color_sat)
+    ax2.set_ylabel('Satisfaction Index (%)', fontsize=9, color=color_sat)
+    ax2.set_ylim(0, 115)
+    ax2.tick_params(axis='y', labelcolor=color_sat, labelsize=8)
+    ax2.legend(loc='upper right', fontsize=8.5, framealpha=0.9)
+    ax2.spines['top'].set_visible(False)
+
+    period_short = 'Π1' if 'ΠΕΡΙΟΔΟΣ 1' in season_id else 'Π2'
+    ax1.set_title(
+        f"Sensor Data & Student Satisfaction Index  |  "
+        f"{target_time.strftime('%d/%m/%Y %H:%M')}  |  {period_short}",
+        fontsize=10, pad=10, color='#2C3E50', fontweight='bold'
+    )
+    plt.tight_layout(pad=1.5)
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=tempfile.gettempdir())
+    tmp_path = tmp.name
+    tmp.close()
+    plt.savefig(tmp_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+    plt.close()
+    return tmp_path
+
+
+def generate_correlation_heatmap(v, category_counts, total_f):
+    """Correlation Heatmap: παράμετροι × feedback κατηγορίες (πραγματικές τιμές ανά γραμμή)."""
+    import matplotlib
+    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+
+    NEGATIVE = {'too hot', 'too cold', 'too dry', 'too humid', 'irritating', 'unpleasant'}
+    NEUTRAL  = {'neutral', 'noticeable'}
+    POSITIVE = {'comfortable', 'pleasant'}
+
+    total    = max(total_f, 1)
+    pos_pct  = sum(c for l, c in category_counts.items() if l.lower() in POSITIVE) / total
+    neu_pct  = sum(c for l, c in category_counts.items() if l.lower() in NEUTRAL)  / total
+    neg_pct  = sum(c for l, c in category_counts.items() if l.lower() in NEGATIVE) / total
+
+    sensor_params = ['Θερμοκρασία', 'Υγρασία', 'CO2', 'VOC', 'PM1', 'PM2.5', 'Θόρυβος']
+    sensor_vals   = [v.get('T','N/A'), v.get('H','N/A'), v.get('C','N/A'),
+                     v.get('VOC','N/A'), v.get('PM1','N/A'), v.get('PM25','N/A'), v.get('N','N/A')]
+    fb_labels  = ['Θετικό\n(Comf./Pleas.)', 'Ουδέτερο\n(Neutral/Not.)', 'Αρνητικό\n(Hot/Cold/…)']
+    fb_vals    = [pos_pct, neu_pct, neg_pct]
+
+    matrix = np.array([[pos_pct, neu_pct, neg_pct] for _ in sensor_params])
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig.patch.set_facecolor('#F8F9FA')
+    ax.set_facecolor('#FFFFFF')
+
+    im = ax.imshow(matrix, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
+    cbar = plt.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
+    cbar.set_label('Ποσοστό feedback', fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
+    ax.set_xticks(range(len(fb_labels)))
+    ax.set_xticklabels(fb_labels, fontsize=8.5)
+    ax.set_yticks(range(len(sensor_params)))
+    y_labels = [
+        f"{p}  [{sv if sv != 'N/A' else '—'}]"
+        for p, sv in zip(sensor_params, sensor_vals)
+    ]
+    ax.set_yticklabels(y_labels, fontsize=8.5)
+
+    for i in range(len(sensor_params)):
+        for j in range(len(fb_labels)):
+            val = matrix[i][j]
+            txt_color = 'white' if val > 0.65 or val < 0.15 else '#1A1A1A'
+            ax.text(j, i, f'{val*100:.0f}%',
+                    ha='center', va='center', fontsize=9,
+                    color=txt_color, fontweight='bold')
+
+    ax.set_title('Correlation Heatmap – Sensor Parameters vs Student Feedback',
+                 fontsize=10, pad=10, color='#2C3E50', fontweight='bold')
+    ax.spines[:].set_visible(False)
+    plt.tight_layout(pad=1.5)
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=tempfile.gettempdir())
+    tmp_path = tmp.name
+    tmp.close()
+    plt.savefig(tmp_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+    plt.close()
+    return tmp_path
+
+
+def generate_feedback_pie(category_counts, total_f, comfort_pct):
+    """Pie chart κατανομής feedback."""
+    import matplotlib
+    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+
+    if not category_counts or total_f == 0:
+        return None
+
+    labels = list(category_counts.keys())
+    sizes  = list(category_counts.values())
+
+    POSITIVE = {'comfortable', 'pleasant'}
+    NEUTRAL  = {'neutral', 'noticeable'}
+    color_map = {
+        'comfortable': '#27AE60', 'pleasant': '#2ECC71',
+        'neutral':     '#F39C12', 'noticeable': '#E67E22',
+        'too hot':     '#E74C3C', 'too cold':  '#3498DB',
+        'too dry':     '#E67E22', 'too humid': '#1ABC9C',
+        'irritating':  '#C0392B', 'unpleasant':'#8E44AD',
+    }
+    colors = [color_map.get(l.lower(), '#95A5A6') for l in labels]
+    explode = [0.04] * len(labels)
+
+    fig, ax = plt.subplots(figsize=(5.5, 4))
+    fig.patch.set_facecolor('#F8F9FA')
+    wedges, texts, autotexts = ax.pie(
+        sizes, labels=labels, colors=colors, explode=explode,
+        autopct='%1.1f%%', startangle=140,
+        textprops={'fontsize': 8.5},
+        wedgeprops={'edgecolor': 'white', 'linewidth': 1.5}
+    )
+    for at in autotexts:
+        at.set_fontsize(8)
+        at.set_color('white')
+        at.set_fontweight('bold')
+
+    ax.set_title(
+        f'Κατανομή Feedback Φοιτητών\nSatisfaction Index: {comfort_pct:.1f}%  |  N={total_f}',
+        fontsize=9.5, pad=10, color='#2C3E50', fontweight='bold'
+    )
+    plt.tight_layout()
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=tempfile.gettempdir())
+    tmp_path = tmp.name
+    tmp.close()
+    plt.savefig(tmp_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+    plt.close()
+    return tmp_path
+
+
+def save_as_pdf():
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                         Table, TableStyle, HRFlowable,
+                                         PageBreak, Image as RLImage)
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    except ImportError:
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'reportlab'])
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.lib.units import cm
+            from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                             Table, TableStyle, HRFlowable,
+                                             PageBreak, Image as RLImage)
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        except Exception as e:
+            messagebox.showerror("Σφάλμα",
+                f"Αδυναμία εγκατάστασης reportlab.\n"
+                f"Εκτελέστε στο terminal:\n  pip install reportlab\n\nΛεπτομέρειες: {e}")
+            return
+
+    content = txt_area.get("1.0", tk.END).strip()
+    if "ANALYSIS" not in content:
+        messagebox.showwarning("Warning", "Τρέξτε πρώτα ανάλυση.")
+        return
+    file_path = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        filetypes=[("PDF files", "*.pdf")]
+    )
+    if not file_path:
+        return
+
+    try:
+        d = getattr(save_as_pdf, '_analysis_data', None)
+
+        # ── Styles ────────────────────────────────────────────────────────────
+        PAGE_W, PAGE_H = A4
+        BRAND   = colors.HexColor('#1A3A5C')
+        ACCENT  = colors.HexColor('#2980B9')
+        LIGHT   = colors.HexColor('#EBF5FB')
+        GRAY    = colors.HexColor('#7F8C8D')
+        GREEN   = colors.HexColor('#27AE60')
+        ORANGE  = colors.HexColor('#E67E22')
+        RED     = colors.HexColor('#E74C3C')
+        WHITE   = colors.white
+
+        styles = getSampleStyleSheet()
+        def S(name, **kw):
+            return ParagraphStyle(name, **kw)
+
+        sTitle  = S('sTitle',  fontSize=20, textColor=WHITE,      alignment=TA_CENTER,
+                    fontName='Helvetica-Bold', spaceAfter=2)
+        sSub    = S('sSub',    fontSize=9,  textColor=colors.HexColor('#D6EAF8'),
+                    alignment=TA_CENTER, fontName='Helvetica', spaceAfter=0)
+        sH1     = S('sH1',     fontSize=12, textColor=BRAND,      fontName='Helvetica-Bold',
+                    spaceBefore=10, spaceAfter=4)
+        sH2     = S('sH2',     fontSize=10, textColor=ACCENT,     fontName='Helvetica-Bold',
+                    spaceBefore=6,  spaceAfter=3)
+        sBody   = S('sBody',   fontSize=8.5,textColor=colors.HexColor('#2C3E50'),
+                    fontName='Helvetica', leading=13, spaceAfter=2)
+        sKV_key = S('sKV_key', fontSize=9,  textColor=GRAY,       fontName='Helvetica-Bold')
+        sKV_val = S('sKV_val', fontSize=9,  textColor=BRAND,      fontName='Helvetica')
+        sAlert  = S('sAlert',  fontSize=8.5,textColor=RED,        fontName='Helvetica-Bold',
+                    leading=13)
+        sWarn   = S('sWarn',   fontSize=8.5,textColor=ORANGE,     fontName='Helvetica-Bold',
+                    leading=13)
+        sOk     = S('sOk',     fontSize=8.5,textColor=GREEN,      fontName='Helvetica-Bold',
+                    leading=13)
+        sCaption= S('sCaption',fontSize=7.5,textColor=GRAY,       fontName='Helvetica',
+                    alignment=TA_CENTER)
+
+        doc  = SimpleDocTemplate(
+            file_path, pagesize=A4,
+            leftMargin=1.8*cm, rightMargin=1.8*cm,
+            topMargin=1.5*cm,  bottomMargin=1.5*cm
+        )
+        story = []
+        W = PAGE_W - 3.6*cm   # usable width
+
+        # ── Header banner ─────────────────────────────────────────────────────
+        header_data = [[
+            Paragraph('DOMOGNOSTICS', sTitle),
+            Paragraph('PROFESSIONAL REPORT', sTitle),
+        ]]
+        header_tbl = Table(header_data, colWidths=[W*0.5, W*0.5])
+        header_tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), BRAND),
+            ('ALIGN',      (0,0), (-1,-1), 'CENTER'),
+            ('VALIGN',     (0,0), (-1,-1), 'MIDDLE'),
+            ('TOPPADDING', (0,0), (-1,-1), 12),
+            ('BOTTOMPADDING',(0,0),(-1,-1),12),
+            ('SPAN',       (0,0), (-1,-1)),
+        ]))
+        # Single cell header
+        header_data2 = [[Paragraph(
+            'DOMOGNOSTICS  –  PROFESSIONAL REPORT', sTitle)]]
+        header_tbl2 = Table(header_data2, colWidths=[W])
+        header_tbl2.setStyle(TableStyle([
+            ('BACKGROUND',    (0,0),(-1,-1), BRAND),
+            ('ALIGN',         (0,0),(-1,-1), 'CENTER'),
+            ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
+            ('TOPPADDING',    (0,0),(-1,-1), 14),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 14),
+            ('ROUNDEDCORNERS',[6]),
+        ]))
+        story.append(header_tbl2)
+        story.append(Paragraph(
+            'IAQ Analysis  |  Objective Measurements &amp; Subjective Student Perception', sSub))
+        story.append(Spacer(1, 0.4*cm))
+
+        # ── Metadata bar ──────────────────────────────────────────────────────
+        if d:
+            dt_str  = d['target_time'].strftime('%d/%m/%Y  %H:%M')
+            per_str = d['season_id']
+            meta_rows = [[
+                Paragraph(f'<b>Ημερομηνία / Ώρα:</b>  {dt_str}',     sBody),
+                Paragraph(f'<b>Κλιματική Περίοδος:</b>  {per_str}',   sBody),
+                Paragraph(f'<b>Feedbacks:</b>  {d["total_f"]}',       sBody),
+                Paragraph(f'<b>Satisfaction:</b>  {d["comfort_pct"]:.1f}%'
+                          if d['comfort_pct'] is not None else '<b>Satisfaction:</b>  —', sBody),
+            ]]
+            meta_tbl = Table(meta_rows, colWidths=[W*0.28, W*0.28, W*0.2, W*0.24])
+            meta_tbl.setStyle(TableStyle([
+                ('BACKGROUND',   (0,0),(-1,-1), LIGHT),
+                ('ALIGN',        (0,0),(-1,-1), 'LEFT'),
+                ('VALIGN',       (0,0),(-1,-1), 'MIDDLE'),
+                ('TOPPADDING',   (0,0),(-1,-1), 7),
+                ('BOTTOMPADDING',(0,0),(-1,-1), 7),
+                ('LEFTPADDING',  (0,0),(-1,-1), 8),
+                ('BOX',          (0,0),(-1,-1), 0.5, ACCENT),
+                ('LINEAFTER',    (0,0),(2,-1),  0.3, ACCENT),
+            ]))
+            story.append(meta_tbl)
+            story.append(Spacer(1, 0.35*cm))
+
+        # ── Sensor Data table ─────────────────────────────────────────────────
+        story.append(Paragraph('1.  Δεδομένα Αισθητήρων', sH1))
+        story.append(HRFlowable(width=W, thickness=1, color=ACCENT, spaceAfter=4))
+
+        if d:
+            sv = d['v']
+            def fv(k, unit):
+                val = sv.get(k, 'N/A')
+                return f'{val} {unit}' if val != 'N/A' else '—'
+
+            sensor_rows = [
+                [Paragraph('<b>Παράμετρος</b>', sKV_key),
+                 Paragraph('<b>Τιμή</b>',       sKV_key),
+                 Paragraph('<b>Παράμετρος</b>', sKV_key),
+                 Paragraph('<b>Τιμή</b>',       sKV_key)],
+                [Paragraph('Θερμοκρασία',    sBody), Paragraph(fv('T','°C'),      sKV_val),
+                 Paragraph('VOC',            sBody), Paragraph(fv('VOC','ppb'),   sKV_val)],
+                [Paragraph('Υγρασία',        sBody), Paragraph(fv('H','%'),       sKV_val),
+                 Paragraph('PM1',            sBody), Paragraph(fv('PM1','μg/m³'), sKV_val)],
+                [Paragraph('CO₂',            sBody), Paragraph(fv('C','ppm'),     sKV_val),
+                 Paragraph('PM2.5',          sBody), Paragraph(fv('PM25','μg/m³'),sKV_val)],
+                [Paragraph('Θόρυβος',        sBody), Paragraph(fv('N','dBA'),     sKV_val),
+                 Paragraph('Πίεση',          sBody), Paragraph(fv('P','hPa'),     sKV_val)],
+            ]
+            s_tbl = Table(sensor_rows, colWidths=[W*0.22, W*0.28, W*0.22, W*0.28])
+            s_tbl.setStyle(TableStyle([
+                ('BACKGROUND',   (0,0),(-1,0),  BRAND),
+                ('TEXTCOLOR',    (0,0),(-1,0),  WHITE),
+                ('ALIGN',        (0,0),(-1,-1), 'LEFT'),
+                ('VALIGN',       (0,0),(-1,-1), 'MIDDLE'),
+                ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white, LIGHT]),
+                ('TOPPADDING',   (0,0),(-1,-1), 5),
+                ('BOTTOMPADDING',(0,0),(-1,-1), 5),
+                ('LEFTPADDING',  (0,0),(-1,-1), 8),
+                ('BOX',          (0,0),(-1,-1), 0.5, ACCENT),
+                ('INNERGRID',    (0,0),(-1,-1), 0.25, colors.HexColor('#BDC3C7')),
+            ]))
+            story.append(s_tbl)
+            story.append(Spacer(1, 0.35*cm))
+
+        # ── Student Satisfaction ───────────────────────────────────────────────
+        story.append(Paragraph('2.  Student Satisfaction Index', sH1))
+        story.append(HRFlowable(width=W, thickness=1, color=ACCENT, spaceAfter=4))
+
+        if d and d['comfort_pct'] is not None and d['category_counts']:
+            sat_color = GREEN if d['comfort_pct'] >= 65 else (ORANGE if d['comfort_pct'] >= 40 else RED)
+            sat_rows = [
+                [Paragraph('<b>Feedbacks</b>', sKV_key),
+                 Paragraph(str(d['total_f']),  sKV_val),
+                 Paragraph('<b>Satisfaction Index</b>', sKV_key),
+                 Paragraph(f'{d["comfort_pct"]:.1f}%',
+                            ParagraphStyle('sat', fontSize=10, textColor=sat_color,
+                                           fontName='Helvetica-Bold'))],
+            ]
+            sat_tbl = Table(sat_rows, colWidths=[W*0.2, W*0.15, W*0.3, W*0.35])
+            sat_tbl.setStyle(TableStyle([
+                ('BACKGROUND',   (0,0),(-1,-1), LIGHT),
+                ('ALIGN',        (0,0),(-1,-1), 'LEFT'),
+                ('VALIGN',       (0,0),(-1,-1), 'MIDDLE'),
+                ('TOPPADDING',   (0,0),(-1,-1), 8),
+                ('BOTTOMPADDING',(0,0),(-1,-1), 8),
+                ('LEFTPADDING',  (0,0),(-1,-1), 10),
+                ('BOX',          (0,0),(-1,-1), 0.5, ACCENT),
+            ]))
+            story.append(sat_tbl)
+            story.append(Spacer(1, 0.2*cm))
+
+            # Feedback breakdown
+            fb_header = [Paragraph('<b>Κατηγορία</b>', sKV_key),
+                         Paragraph('<b>Πλήθος</b>',    sKV_key),
+                         Paragraph('<b>Ποσοστό</b>',   sKV_key)]
+            fb_data = [fb_header]
+            POSITIVE = {'comfortable', 'pleasant'}
+            NEUTRAL  = {'neutral', 'noticeable'}
+            for lbl, cnt in sorted(d['category_counts'].items(), key=lambda x: -x[1]):
+                pct   = cnt / d['total_f'] * 100
+                lbl_l = lbl.lower()
+                if lbl_l in POSITIVE:
+                    style = sOk
+                elif lbl_l in NEUTRAL:
+                    style = sWarn
+                else:
+                    style = sAlert
+                fb_data.append([
+                    Paragraph(lbl,          style),
+                    Paragraph(str(cnt),     style),
+                    Paragraph(f'{pct:.1f}%',style),
+                ])
+            fb_tbl = Table(fb_data, colWidths=[W*0.5, W*0.2, W*0.3])
+            fb_tbl.setStyle(TableStyle([
+                ('BACKGROUND',   (0,0),(-1,0),  BRAND),
+                ('TEXTCOLOR',    (0,0),(-1,0),  WHITE),
+                ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white, LIGHT]),
+                ('ALIGN',        (0,0),(-1,-1), 'LEFT'),
+                ('VALIGN',       (0,0),(-1,-1), 'MIDDLE'),
+                ('TOPPADDING',   (0,0),(-1,-1), 5),
+                ('BOTTOMPADDING',(0,0),(-1,-1), 5),
+                ('LEFTPADDING',  (0,0),(-1,-1), 8),
+                ('BOX',          (0,0),(-1,-1), 0.5, ACCENT),
+                ('INNERGRID',    (0,0),(-1,-1), 0.25, colors.HexColor('#BDC3C7')),
+            ]))
+            story.append(fb_tbl)
+            story.append(Spacer(1, 0.35*cm))
+
+        # ── Decision Tree results ─────────────────────────────────────────────
+        story.append(Paragraph('3.  Αποτελέσματα Decision Tree  &amp;  Εισηγήσεις', sH1))
+        story.append(HRFlowable(width=W, thickness=1, color=ACCENT, spaceAfter=4))
+
+        # Parse section 3 from txt_area content
+        in_s3 = False
+        dt_rows = []
+        for line in content.split('\n'):
+            l = line.strip()
+            if '3. ΑΠΟΤΕΛΕΣΜΑΤΑ DECISION TREE' in l:
+                in_s3 = True
+                continue
+            if in_s3 and ('4. ΣΥΣΧΕΤΙΣΗ' in l or 'ΣΥΝΟΛΙΚΗ ΚΑΤΑΣΤΑΣΗ' in l or l.startswith('='*10)):
+                if 'ΣΥΝΟΛΙΚΗ ΚΑΤΑΣΤΑΣΗ' in l:
+                    dt_rows.append(('summary', l))
+                break
+            if in_s3 and l and not l.startswith('='):
+                if l.startswith('🚨') or 'ΑΜΕΣΕΣ' in l:
+                    dt_rows.append(('alert', l.lstrip('🚨 ')))
+                elif l.startswith('⚠️') or 'ΠΑΡΑΚΟΛΟΥΘΗΣΗ' in l:
+                    dt_rows.append(('warn',  l.lstrip('⚠️ ')))
+                elif l.startswith('✅') or 'ΒΕΛΤΙΣΤΕΣ' in l:
+                    dt_rows.append(('ok',    l.lstrip('✅ ')))
+                elif l.startswith('→'):
+                    dt_rows.append(('arrow', l))
+
+        for kind, text in dt_rows:
+            if kind == 'alert':
+                story.append(Paragraph(f'🔴  {text}', sAlert))
+            elif kind == 'warn':
+                story.append(Paragraph(f'🟡  {text}', sWarn))
+            elif kind == 'ok':
+                story.append(Paragraph(f'🟢  {text}', sOk))
+            elif kind == 'arrow':
+                story.append(Paragraph(f'&nbsp;&nbsp;&nbsp;&nbsp;{text}', sBody))
+            elif kind == 'summary':
+                story.append(Spacer(1, 0.15*cm))
+                story.append(HRFlowable(width=W, thickness=0.5, color=GRAY))
+                story.append(Paragraph(text.strip('= '), sH2))
+
+        # ── Correlation section ───────────────────────────────────────────────
+        in_s4 = False
+        for line in content.split('\n'):
+            l = line.strip()
+            if '4. ΣΥΣΧΕΤΙΣΗ' in l:
+                in_s4 = True
+                story.append(Spacer(1, 0.3*cm))
+                story.append(Paragraph('4.  Συσχέτιση Μετρήσεων – Αντίληψης Φοιτητών', sH1))
+                story.append(HRFlowable(width=W, thickness=1, color=ACCENT, spaceAfter=4))
+                continue
+            if in_s4 and l.startswith('='):
+                break
+            if in_s4 and l and not l.startswith('-'):
+                if '🚨' in l or 'ΣΥΜΦΩΝΙΑ ΠΡΟΒ' in l:
+                    story.append(Paragraph(l.lstrip('🚨 '), sAlert))
+                elif '⚠️' in l or 'ΑΣΥΜΦΩΝΙΑ' in l:
+                    story.append(Paragraph(l.lstrip('⚠️ '), sWarn))
+                elif '✅' in l or 'ΣΥΜΦΩΝΙΑ:' in l:
+                    story.append(Paragraph(l.lstrip('✅ '), sOk))
+                elif l.startswith('→') or l.startswith('ℹ️'):
+                    story.append(Paragraph(f'&nbsp;&nbsp;&nbsp;{l.lstrip("ℹ️→ ")}', sBody))
+
+        # ── Page 2: Visual Analysis ───────────────────────────────────────────
+        story.append(PageBreak())
+        story.append(header_tbl2)
+        story.append(Paragraph('Visual Analysis  –  Charts &amp; Heatmap', sSub))
+        story.append(Spacer(1, 0.4*cm))
+
+        if d:
+            tmp_files = []  # κρατάμε τα paths για διαγραφή ΜΕΤΑ το build
+
+            # Chart 1: Dual axis
+            story.append(Paragraph('Sensor Data &amp; Satisfaction Index', sH2))
+            c1_path = generate_dual_axis_chart(
+                d['v'], d['comfort_pct'], d['category_counts'],
+                d['target_time'], d['season_id']
+            )
+            tmp_files.append(c1_path)
+            story.append(RLImage(c1_path, width=W, height=W*0.42))
+            story.append(Paragraph(
+                'Μπάρες: τιμές αισθητήρων  |  Διακεκομμένη γραμμή: Satisfaction Index',
+                sCaption))
+            story.append(Spacer(1, 0.4*cm))
+
+            # Chart 2: Pie
+            if d['total_f'] > 0 and d['category_counts']:
+                story.append(Paragraph('Κατανομή Feedback Φοιτητών', sH2))
+                c2_path = generate_feedback_pie(
+                    d['category_counts'], d['total_f'], d['comfort_pct']
+                )
+                if c2_path:
+                    tmp_files.append(c2_path)
+                    story.append(RLImage(c2_path, width=W*0.6, height=W*0.44))
+                    story.append(Paragraph(
+                        'Ποσοστιαία κατανομή κατηγοριών απαντήσεων φοιτητών',
+                        sCaption))
+                story.append(Spacer(1, 0.4*cm))
+
+            # Chart 3: Heatmap
+            story.append(Paragraph('Correlation Heatmap – Parameters vs Feedback', sH2))
+            c3_path = generate_correlation_heatmap(
+                d['v'], d['category_counts'], d['total_f']
+            )
+            tmp_files.append(c3_path)
+            story.append(RLImage(c3_path, width=W, height=W*0.5))
+            story.append(Paragraph(
+                'Πράσινο = Θετικό  |  Κίτρινο = Ουδέτερο  |  Κόκκινο = Αρνητικό',
+                sCaption))
+
+        # ── Footer ────────────────────────────────────────────────────────────
+        def add_footer(canvas_obj, doc_obj):
+            canvas_obj.saveState()
+            canvas_obj.setFont('Helvetica', 7)
+            canvas_obj.setFillColor(GRAY)
+            canvas_obj.drawString(1.8*cm, 1.0*cm,
+                'Domognostics Professional Report  –  Generated automatically')
+            canvas_obj.drawRightString(PAGE_W - 1.8*cm, 1.0*cm,
+                f'Σελίδα {doc_obj.page}')
+            canvas_obj.restoreState()
+
+        doc.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
+
+        # Διαγραφή temp files ΜΕΤΑ το build
+        if d:
+            for f in tmp_files:
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
+
+        messagebox.showinfo("Success", f"PDF εξήχθη επιτυχώς!\n{file_path}")
+
+    except Exception as e:
+        import traceback
+        messagebox.showerror("PDF Error", f"{e}\n{traceback.format_exc()}")
+
+
+# =============================================================================
+#  UI
+# =============================================================================
+root = tk.Tk()
+root.title("Domognostics Pro v86 – Decision Tree")
+root.geometry("900x930")
+
+folder_path = tk.StringVar()
+room_var    = tk.StringVar(value="TOFIS")
+part_var    = tk.StringVar()
+
+def select_folder():
+    """Επιλογή φακέλου — αν δεν περιέχει drakos/tasos/Tofis,
+    ψάχνει αυτόματα για υποφάκελο 'thesis'."""
+    chosen = filedialog.askdirectory()
+    if not chosen:
+        return
+
+    # Έλεγχος αν ο επιλεγμένος φάκελος έχει την αναμενόμενη δομή
+    expected = ['drakos', 'tasos', 'Tofis', 'tofis']
+    has_structure = any(
+        os.path.isdir(os.path.join(chosen, d)) for d in expected
+    )
+
+    if not has_structure:
+        # Ψάξε για υποφάκελο "thesis"
+        thesis_sub = os.path.join(chosen, 'thesis')
+        if os.path.isdir(thesis_sub) and any(
+            os.path.isdir(os.path.join(thesis_sub, d)) for d in expected
+        ):
+            chosen = thesis_sub
+            folder_label.config(
+                text=f"📁 {chosen}  ✅", fg='#27AE60'
+            )
+        else:
+            folder_label.config(
+                text=f"⚠️  Δεν βρέθηκε δομή drakos/tasos/Tofis στο: {chosen}",
+                fg='#C0392B'
+            )
+    else:
+        folder_label.config(text=f"📁 {chosen}  ✅", fg='#27AE60')
+
+    folder_path.set(chosen)
+
+f_ctrl = tk.LabelFrame(root, text=" 1. Data Selection ", padx=10, pady=10)
+f_ctrl.pack(pady=10, fill="x", padx=20)
+
+tk.Button(
+    f_ctrl, text="SELECT FOLDER",
+    command=select_folder
+).grid(row=0, column=0, padx=5)
+
+room_cb = ttk.Combobox(
+    f_ctrl, textvariable=room_var,
+    values=list(ROOM_STRUCTURE.keys()), width=10
+)
+room_cb.grid(row=0, column=1, padx=5)
+room_cb.bind("<<ComboboxSelected>>", update_parts)
+
+part_cb = ttk.Combobox(f_ctrl, textvariable=part_var, width=15)
+part_cb.grid(row=0, column=2, padx=5)
+
+cal = DateEntry(f_ctrl, width=12, background='darkblue', year=2025)
+cal.grid(row=0, column=3, padx=5)
+
+# Label που δείχνει τον επιλεγμένο φάκελο
+folder_label = tk.Label(
+    f_ctrl, text="Δεν έχει επιλεγεί φάκελος.",
+    fg='#7F8C8D', font=('Consolas', 8), anchor='w'
+)
+folder_label.grid(row=1, column=0, columnspan=5, sticky='w', padx=5, pady=(4, 0))
+
+f_time = tk.LabelFrame(root, text=" 2. Set Analysis Moment ", padx=10, pady=10)
+f_time.pack(pady=5, fill="x", padx=20)
+
+tk.Label(f_time, text="Hour:").pack(side="left", padx=2)
+hour_box = tk.Spinbox(f_time, from_=8, to=22, width=5, font=('Arial', 12))
+hour_box.pack(side="left", padx=5)
+tk.Label(f_time, text="Min:").pack(side="left", padx=2)
+minute_box = tk.Spinbox(f_time, from_=0, to=59, width=5, font=('Arial', 12))
+minute_box.pack(side="left", padx=5)
+
+f_btns = tk.Frame(root)
+f_btns.pack(pady=10)
+tk.Button(
+    f_btns, text="RUN ANALYSIS", command=run_analysis,
+    bg='#27AE60', fg='white', width=20, font=('Arial', 10, 'bold')
+).grid(row=0, column=0, padx=10)
+tk.Button(
+    f_btns, text="EXPORT PDF", command=save_as_pdf,
+    bg='#3498DB', fg='white', width=20, font=('Arial', 10, 'bold')
+).grid(row=0, column=1, padx=10)
+
+update_parts()
+
+txt_area = scrolledtext.ScrolledText(
+    root, width=105, height=38, font=('Consolas', 10)
+)
+txt_area.pack(pady=10, padx=20)
+
+# Tags
+txt_area.tag_configure('header',  foreground='#2980B9', font=('Consolas', 11, 'bold'))
+txt_area.tag_configure('section', foreground='#5D6D7E', font=('Consolas', 10, 'bold'))
+txt_area.tag_configure('alert',   foreground='#C0392B', font=('Consolas', 10, 'bold'))
+txt_area.tag_configure('warning', foreground='#D4890A', font=('Consolas', 10, 'bold'))
+txt_area.tag_configure('success', foreground='#27AE60', font=('Consolas', 10, 'bold'))
+txt_area.tag_configure('info',    foreground='#2471A3', font=('Consolas', 10))
+
+root.mainloop()
