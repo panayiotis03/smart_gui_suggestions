@@ -68,42 +68,108 @@ def get_seasonal_context(sel_date):
     return "ΕΚΤΟΣ ΠΕΡΙΟΔΟΥ"
 
 
-def find_file_in_uploaded(uploaded_files, keywords_include, keywords_exclude=None):
-    """Search uploaded files by name keywords."""
-    keywords_exclude = keywords_exclude or []
-    for uf in uploaded_files:
-        name = uf.name.lower()
-        name_no_ext = os.path.splitext(name)[0]
-        if any(k in name_no_ext for k in keywords_include):
-            if not any(k in name for k in keywords_exclude):
-                return uf
-    return None
-
-
 def find_sensor_file(uploaded_files, room, part, month_num):
+    """
+    Βρίσκει το sensor CSV για συγκεκριμένη αίθουσα/τμήμα/μήνα.
+    
+    Λογική ονοματολογίας:
+      TOFIS   → sep.csv / oct.csv / ...  (χωρίς prefix)
+      DRAKOS  → drakos_front_sep.csv  ή  drakos_back_oct.csv
+                ή drakos front sep.csv  κλπ. (με κενό/underscore/χωρίς)
+      TASOS   → tasos_front_left_sep.csv  κλπ.  (ή sensor folder name)
+    """
     aliases = MONTH_FILE_ALIASES.get(month_num, [])
+    room_l  = room.lower()
+    part_l  = part.lower().replace(' ', '_')
+
     for uf in uploaded_files:
-        name_no_ext = os.path.splitext(uf.name)[0].lower()
-        if uf.name.lower().endswith('.csv') and 'feedback' not in uf.name.lower():
-            if name_no_ext in aliases:
+        name     = uf.name.lower()
+        name_noext = os.path.splitext(name)[0]
+
+        if 'feedback' in name:
+            continue
+        if not name.endswith('.csv'):
+            continue
+
+        # Έλεγχος αν το όνομα περιέχει κάποιο alias του μήνα
+        month_match = any(alias in name_noext.split('_') or name_noext == alias
+                          for alias in aliases)
+        if not month_match:
+            # fallback: απλός έλεγχος αν το alias εμφανίζεται οπουδήποτε στο όνομα
+            month_match = any(alias in name_noext for alias in aliases)
+        if not month_match:
+            continue
+
+        if room == "TOFIS":
+            # Δεχόμαστε: sep.csv, tofis_sep.csv, tofis sep.csv
+            if room_l in name_noext or name_noext in aliases:
                 return uf
+            # Αν το αρχείο είναι ΜΟΝΟ ο μήνας (π.χ. sep.csv) και δεν αναφέρει άλλη αίθουσα
+            other_rooms = ['drakos', 'tasos']
+            if not any(r in name_noext for r in other_rooms):
+                return uf
+
+        elif room == "DRAKOS":
+            part_variants = [part.lower(), part_l]  # "front", "front"
+            if 'drakos' in name_noext and any(p in name_noext for p in part_variants):
+                return uf
+
+        elif room == "TASOS":
+            # Υποστηρίζουμε sensor folder names κιόλας
+            sensor_folder = TASOS_SENSOR_FOLDER.get(part, '').lower()
+            if 'tasos' in name_noext:
+                if part_l in name_noext or sensor_folder.replace('tasos_','') in name_noext:
+                    return uf
+
     return None
 
 
 def find_feedback_file(uploaded_files, room, part, month_num):
+    """
+    Βρίσκει το feedback CSV.
+    Αποδεκτές μορφές (case-insensitive):
+      TOFIS_Oct_feedbacks.csv
+      DRAKOS_Front_Oct_feedbacks.csv
+      TASOS_Front_Left_Oct_feedbacks.csv
+    """
     fb_month = MONTH_FEEDBACK_NAME.get(month_num, '')
+
     if room == "TOFIS":
-        candidates = [f"tofis_{fb_month.lower()}_feedbacks.csv"]
+        candidates = [
+            f"tofis_{fb_month.lower()}_feedbacks.csv",
+            f"tofis_{fb_month}_feedbacks.csv",
+        ]
     elif room == "DRAKOS":
-        candidates = [f"drakos_{part.lower()}_{fb_month.lower()}_feedbacks.csv"]
+        candidates = [
+            f"drakos_{part.lower()}_{fb_month.lower()}_feedbacks.csv",
+            f"drakos_{part}_{fb_month}_feedbacks.csv",
+        ]
     elif room == "TASOS":
-        candidates = [f"tasos_{part.lower()}_{fb_month.lower()}_feedbacks.csv"]
+        candidates = [
+            f"tasos_{part.lower()}_{fb_month.lower()}_feedbacks.csv",
+            f"tasos_{part}_{fb_month}_feedbacks.csv",
+            f"tasos_{part_l}_{fb_month.lower()}_feedbacks.csv".replace(' ','_')
+            if (part_l := part.lower().replace(' ','_')) else "",
+        ]
     else:
         candidates = []
 
     for uf in uploaded_files:
-        if uf.name.lower() in candidates:
+        if uf.name.lower() in [c.lower() for c in candidates if c]:
             return uf
+
+    # Fallback: fuzzy — αρχείο που περιέχει room+part+month+feedback
+    fb_month_l = fb_month.lower()
+    room_l     = room.lower()
+    part_l     = part.lower().replace(' ', '_').replace('_', '')
+
+    for uf in uploaded_files:
+        name = uf.name.lower().replace(' ','_')
+        if 'feedback' in name and room_l in name and fb_month_l in name:
+            part_clean = part.lower().replace('_','').replace(' ','')
+            if part_clean in name.replace('_',''):
+                return uf
+
     return None
 
 
@@ -776,39 +842,91 @@ with st.sidebar:
     with col_h: hour   = st.number_input("Ώρα",   min_value=8,  max_value=22, value=10)
     with col_m: minute = st.number_input("Λεπτά", min_value=0,  max_value=59, value=0)
 
-    st.subheader("3. Αρχεία CSV")
-    st.info("""
-**Ανέβασε τα CSV αρχεία σου:**
-- Sensor CSV: `sep.csv`, `oct.csv`, `nov.csv`, κλπ.
-- Feedback CSV: `TOFIS_Oct_feedbacks.csv`, `DRAKOS_Front_Nov_feedbacks.csv`, κλπ.
+    st.subheader("3. Αρχεία CSV — Bulk Upload")
+    st.markdown("""
+> 💡 **Ανέβασε ΟΛΑ τα CSV μαζί** από τους φακέλους  
+> `drakos/`, `tasos/`, `Tofis/` — η εφαρμογή τα αναγνωρίζει αυτόματα.
 """)
+
     uploaded_files = st.file_uploader(
-        "Επέλεξε CSV αρχεία",
+        "Επέλεξε όλα τα CSV αρχεία (από όλους τους φακέλους)",
         type=['csv'],
         accept_multiple_files=True,
-        help="Ανέβασε όλα τα απαραίτητα CSV αρχεία ταυτόχρονα."
+        help=(
+            "Κράτα Ctrl (ή Cmd) για πολλαπλή επιλογή. "
+            "Μπορείς να επιλέξεις αρχεία από διαφορετικούς φακέλους κάνοντας "
+            "navigate μέσα στο dialog."
+        )
     )
 
-    run_btn = st.button("▶️  RUN ANALYSIS", type="primary", use_container_width=True)
+    # ── Απογραφή ανεβασμένων αρχείων ─────────────────────────────────────────
+    if uploaded_files:
+        st.success(f"✅ {len(uploaded_files)} αρχεία φορτώθηκαν")
+
+        # Κατηγοριοποίηση
+        sensors   = [f for f in uploaded_files if 'feedback' not in f.name.lower()]
+        feedbacks = [f for f in uploaded_files if 'feedback' in f.name.lower()]
+
+        with st.expander(f"📂 Sensor CSVs ({len(sensors)})", expanded=False):
+            for f in sorted(sensors, key=lambda x: x.name):
+                st.markdown(f"• `{f.name}`")
+
+        with st.expander(f"📋 Feedback CSVs ({len(feedbacks)})", expanded=False):
+            for f in sorted(feedbacks, key=lambda x: x.name):
+                st.markdown(f"• `{f.name}`")
+
+        # Quick-check: βρίσκουμε αυτό που θα χρησιμοποιηθεί για τις επιλεγμένες ρυθμίσεις
+        month_num = sel_date.strftime('%m')
+        s_preview = find_sensor_file(uploaded_files, room, part, month_num)
+        f_preview = find_feedback_file(uploaded_files, room, part, month_num)
+        st.markdown("**Αντιστοίχιση για επιλεγμένες ρυθμίσεις:**")
+        st.markdown(
+            f"{'✅' if s_preview else '❌'} Sensor: `{s_preview.name if s_preview else 'ΔΕΝ ΒΡΕΘΗΚΕ'}`"
+        )
+        st.markdown(
+            f"{'✅' if f_preview else '❌'} Feedback: `{f_preview.name if f_preview else 'ΔΕΝ ΒΡΕΘΗΚΕ'}`"
+        )
+
+    run_btn = st.button("▶️  RUN ANALYSIS", type="primary", use_container_width=True,
+                        disabled=not uploaded_files)
 
 # ── Main Area ─────────────────────────────────────────────────────────────────
 if not uploaded_files:
-    st.info("👈 Ανέβασε τα CSV αρχεία σου από το sidebar και πάτα **RUN ANALYSIS**.")
-    with st.expander("📋 Οδηγίες χρήσης"):
-        st.markdown("""
-### Πώς να χρησιμοποιήσεις το Domognostics Pro
+    st.info("👈 Ανέβασε **όλα τα CSV** από το sidebar και πάτα **RUN ANALYSIS**.")
 
-1. **Επέλεξε αίθουσα** (TOFIS / DRAKOS / TASOS) και τμήμα.
-2. **Ορισμός ημερομηνίας & ώρας** ανάλυσης.
-3. **Ανέβασε τα CSV αρχεία**:
-   - **Sensor CSV**: Όνομα αρχείου = μήνας (π.χ. `sep.csv`, `oct.csv`, `nov.csv`, `dec.csv`, `jan.csv`)
-   - **Feedback CSV**: Μορφή `{ROOM}_{Part}_{Month}_feedbacks.csv`
-     - π.χ. `TOFIS_Oct_feedbacks.csv`
-     - π.χ. `DRAKOS_Front_Nov_feedbacks.csv`
-     - π.χ. `TASOS_Front_Left_Dec_feedbacks.csv`
-4. Πάτα **RUN ANALYSIS**.
-5. Κατέβασε το **PDF** με την πλήρη αναφορά.
-        """)
+    col_g1, col_g2 = st.columns(2)
+    with col_g1:
+        st.markdown("""
+**🔬 Sensor CSVs** — Όνομα αρχείου = μήνας
+
+| Αίθουσα | Παράδειγμα ονόματος |
+|---------|---------------------|
+| TOFIS | `sep.csv` ή `tofis_sep.csv` |
+| DRAKOS Front | `drakos_front_oct.csv` |
+| DRAKOS Back | `drakos_back_oct.csv` |
+| TASOS Front Left | `tasos_front_left_nov.csv` |
+| TASOS Back Right | `tasos_back_right_dec.csv` |
+
+Αποδεκτές συντομογραφίες: `sep` · `oct` · `nov` · `dec` · `jan`
+""")
+    with col_g2:
+        st.markdown("""
+**📋 Feedback CSVs** — Μορφή: `{ROOM}_{Part}_{Month}_feedbacks.csv`
+
+| | Παράδειγμα |
+|-|------------|
+| TOFIS | `TOFIS_Sep_feedbacks.csv` |
+| DRAKOS Front | `DRAKOS_Front_Oct_feedbacks.csv` |
+| TASOS FL | `TASOS_Front_Left_Dec_feedbacks.csv` |
+
+*Τα ονόματα είναι case-insensitive.*
+""")
+
+    st.info("""
+**🗂️ Πώς να ανεβάσεις γρήγορα (Windows):**  
+Άνοιξε το Upload dialog → πήγαινε στον φάκελο `thesis/Tofis/` → Ctrl+A → μετά Ctrl+κλικ στα αρχεία από `drakos/` και `tasos/` → Άνοιγμα.  
+Όλα ανεβαίνουν μαζί! ✅
+""")
     st.stop()
 
 if run_btn or ('last_result' in st.session_state and st.session_state.get('auto_run')):
